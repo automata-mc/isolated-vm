@@ -5,6 +5,7 @@
 #include "script_handle.h"
 #include "module_handle.h"
 #include "session_handle.h"
+#include "external_copy/serializer.h"
 #include "external_copy/external_copy.h"
 #include "lib/lockable.h"
 #include "isolate/allocator.h"
@@ -68,6 +69,7 @@ auto IsolateHandle::Definition() -> Local<FunctionTemplate> {
 auto IsolateHandle::New(MaybeLocal<Object> maybe_options) -> unique_ptr<ClassHandle> {
 	shared_ptr<v8::BackingStore> snapshot_blob;
 	RemoteHandle<Function> error_handler;
+	RemoteHandle<Function> dynamic_import_handler;
 	size_t snapshot_blob_length = 0;
 	size_t memory_limit = 128;
 	bool inspector = false;
@@ -107,16 +109,102 @@ auto IsolateHandle::New(MaybeLocal<Object> maybe_options) -> unique_ptr<ClassHan
 		if (maybe_handler.ToLocal(&error_handler_local)) {
 			error_handler = RemoteHandle<Function>{error_handler_local};
 		}
+
+		auto possibly_handler = ReadOption<MaybeLocal<Function>>(options, StringTable::Get().dynamicImportHandler, {});
+		Local<Function> dynamic_import_handler_local;
+		if (possibly_handler.ToLocal(&dynamic_import_handler_local)) {
+			dynamic_import_handler = RemoteHandle<Function>{dynamic_import_handler_local};
+		}
 	}
 
 	// Return isolate handle
 	auto holder = IsolateEnvironment::New(memory_limit, std::move(snapshot_blob), snapshot_blob_length);
 	auto env = holder->GetIsolate();
 	env->GetIsolate()->SetHostInitializeImportMetaObjectCallback(ModuleHandle::InitializeImportMeta);
+	env->GetIsolate()->SetData(0, holder.get());
 	env->error_handler = error_handler;
+	env->dynamic_import_handler = dynamic_import_handler;
 	if (inspector) {
 		env->EnableInspectorAgent();
 	}
+	if (dynamic_import_handler) {
+		env->GetIsolate()->SetHostImportModuleDynamicallyCallback([](Local<Context> context, Local<Data> host_defined_options,
+																							   Local<Value> resource_name, Local<String> specifier,
+																							   Local<FixedArray> import_assertions)
+		{
+			class DynamicImportTask : public ThreePhaseTask {
+				ExternalCopyString specifier;
+				RemoteHandle<Function> dynamic_import_handler;
+				std::unique_ptr<Transferable> result;
+			public:
+				DynamicImportTask(Local<String> specifier, RemoteHandle<Function> dynamic_import_handler) :
+					specifier{specifier}, dynamic_import_handler{std::move(dynamic_import_handler)} {}
+
+				void Phase2() final {
+					// Setup context
+					auto* isolate = Isolate::GetCurrent();
+					auto& env = *IsolateEnvironment::GetCurrent();
+					auto fn = Deref(dynamic_import_handler);
+					auto ctx = fn->GetCreationContextChecked();
+					Context::Scope context_scope{ctx};
+					// Copy arguments into isolate
+
+					Local<Value> arg = specifier.CopyInto();
+					
+					// Run function and transfer out
+					auto maybe_value = fn->Call(ctx, Undefined(isolate), 2, &arg);
+					if (env.DidHitMemoryLimit()) {
+						throw FatalRuntimeError("Isolate was disposed during execution due to memory limit");
+					} else if (env.terminated) {
+						throw FatalRuntimeError("Isolate was disposed during execution");
+					}
+					auto value = Unmaybe(maybe_value);
+					TransferOptions options{TransferOptions::Type::Copy};
+					options.promise = true;
+					result = ivm::TransferOut(value, options);
+				}
+
+				auto Phase3() -> Local<Value> final {
+					if (result) {
+						auto res = result->TransferIn();
+						if (res->IsPromise()) {
+							auto context = res.As<Promise>()->GetCreationContextChecked();
+							auto func = Unmaybe(Function::New(context, [](const FunctionCallbackInfo<Value>& info) {
+								auto module = ClassHandle::Unwrap<ModuleHandle>(info[0].As<Object>());
+								auto& mod_info = module->GetInfo();
+								auto& mod = mod_info->handle.Deref();
+								Local<Context> context_local = Deref(mod_info->context_handle);
+								auto retval = Unmaybe(mod->Evaluate(context_local));
+								retval = Unmaybe(retval.As<Promise>()->Then(context_local, Unmaybe(Function::New(context_local, [](const FunctionCallbackInfo<Value>& info) {
+									auto module = ClassHandle::Unwrap<ModuleHandle>(info.Data().As<Object>());
+									auto& mod_info = module->GetInfo();
+									auto& mod = mod_info->handle.Deref();
+									auto context = mod_info->context_handle.Deref();
+
+									info.GetReturnValue().Set(mod->GetModuleNamespace());
+									
+									std::lock_guard<std::mutex> lock(mod_info->mutex);
+									mod_info->global_namespace = RemoteHandle<Value>(mod->GetModuleNamespace());
+								}, info[0]))));
+								info.GetReturnValue().Set(retval);
+							}));
+							auto maybePromise = res.As<Promise>()->Then(context, func);
+							res = Unmaybe(maybePromise);
+							return res;
+						}
+						return res;
+					} else {
+						return Undefined(Isolate::GetCurrent());
+					}
+				}
+			};
+			auto env = IsolateEnvironment::GetCurrent();
+			auto val = DynamicImportTask::Run<0, DynamicImportTask>(*env->dynamic_import_handler.GetIsolateHolder(), specifier, env->dynamic_import_handler);
+			auto promise = val.As<Promise>();
+			return MaybeLocal<Promise>(promise);
+		});
+	}
+
 	return std::make_unique<IsolateHandle>(holder);
 }
 

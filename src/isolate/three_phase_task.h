@@ -7,6 +7,7 @@
 #include "stack_trace.h"
 #include "util.h"
 #include <memory>
+#include <utility>
 
 namespace ivm {
 
@@ -94,41 +95,54 @@ class ThreePhaseTask {
 
 		template <int async, typename T, typename ...Args>
 		static auto Run(IsolateHolder& second_isolate, Args&&... args) -> v8::Local<v8::Value> {
-
-			if (async == 1) { // Full async, promise returned
-				// Build a promise for outer isolate
-				v8::Isolate* isolate = v8::Isolate::GetCurrent();
-				auto context_local = isolate->GetCurrentContext();
-				auto promise_local = Unmaybe(v8::Promise::Resolver::New(context_local));
-				auto stack_trace = v8::StackTrace::CurrentStackTrace(isolate, 10);
-				FunctorRunners::RunCatchValue([&]() {
+			switch (async) {
+				case 1: { // Full async, promise returned
+					// Build a promise for outer isolate
+					v8::Isolate* isolate = v8::Isolate::GetCurrent();
+					auto context_local = isolate->GetCurrentContext();
+					auto promise_local = Unmaybe(v8::Promise::Resolver::New(context_local));
+					auto stack_trace = v8::StackTrace::CurrentStackTrace(isolate, 10);
+					FunctorRunners::RunCatchValue([&]() {
+						// Schedule Phase2 async
+						second_isolate.ScheduleTask(
+							std::make_unique<Phase2Runner>(
+								std::make_unique<T>(std::forward<Args>(args)...), // <-- Phase1 / ctor called here
+								CalleeInfo{promise_local, context_local, stack_trace}
+							), false, true
+						);
+					}, [&](v8::Local<v8::Value> error) {
+						// A C++ error was caught while running ctor (phase 1)
+						if (error->IsObject()) {
+							StackTraceHolder::AttachStack(error.As<v8::Object>(), stack_trace);
+						}
+						Unmaybe(promise_local->Reject(context_local, error));
+					});
+					return promise_local->GetPromise();
+				}
+				case 2: { // Async, promise ignored
 					// Schedule Phase2 async
 					second_isolate.ScheduleTask(
-						std::make_unique<Phase2Runner>(
-							std::make_unique<T>(std::forward<Args>(args)...), // <-- Phase1 / ctor called here
-							CalleeInfo{promise_local, context_local, stack_trace}
+						std::make_unique<Phase2RunnerIgnored>(
+							std::make_unique<T>(std::forward<Args>(args)...) // <-- Phase1 / ctor called here
 						), false, true
 					);
-				}, [&](v8::Local<v8::Value> error) {
-					// A C++ error was caught while running ctor (phase 1)
-					if (error->IsObject()) {
-						StackTraceHolder::AttachStack(error.As<v8::Object>(), stack_trace);
-					}
-					Unmaybe(promise_local->Reject(context_local, error));
-				});
-				return promise_local->GetPromise();
-			} else if (async == 2) { // Async, promise ignored
-				// Schedule Phase2 async
-				second_isolate.ScheduleTask(
-					std::make_unique<Phase2RunnerIgnored>(
-						std::make_unique<T>(std::forward<Args>(args)...) // <-- Phase1 / ctor called here
-					), false, true
-				);
-				return v8::Undefined(v8::Isolate::GetCurrent());
-			} else {
-				// Execute synchronously
-				T self(std::forward<Args>(args)...);
-				return self.RunSync(second_isolate, async == 4);
+					return v8::Undefined(v8::Isolate::GetCurrent());
+				}
+				case 0:
+				case 4: {
+					// Execute synchronously
+					T self(std::forward<Args>(args)...);
+					return self.RunSync(second_isolate, async == 4);
+				}
+				default:
+					static_assert(async >= 0 && async <= 4 && async != 3, "Invalid async kind for ThreePhaseTask");
+					#ifdef __GNUC__ // GCC, Clang, ICC
+						__builtin_unreachable();
+					#endif
+					#ifdef _MSC_VER // MSVC
+						__assume(false);
+					#endif
+					return Undefined(v8::Isolate::GetCurrent());
 			}
 		}
 };

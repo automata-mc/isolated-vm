@@ -4,6 +4,7 @@
 #include <deque>
 #include <memory>
 #include <vector>
+#include <cstdio>
 
 namespace ivm {
 namespace detail {
@@ -75,7 +76,9 @@ class BaseSerializer {
 
 			// Save to buffer
 			auto serialized_data = serializer.Release();
-			buffer = {serialized_data.first, std::free};
+			buffer = {serialized_data.first, deleteBuffer};
+			bool isValid = _CrtIsValidHeapPointer(buffer.get());
+			DebugBreak();
 			size = serialized_data.second;
 		}
 
@@ -84,6 +87,8 @@ class BaseSerializer {
 			// Initialize deserializer and delegate
 			auto* isolate = v8::Isolate::GetCurrent();
 			auto context = isolate->GetCurrentContext();
+			bool isValid = _CrtIsValidHeapPointer(buffer.get());
+			DebugBreak();
 			detail::DeserializerDelegate delegate{transferables, wasm_modules};
 			v8::ValueDeserializer deserializer{isolate, buffer.get(), size, &delegate};
 			delegate.SetDeserializer(&deserializer);
@@ -106,7 +111,14 @@ class BaseSerializer {
 		}
 
 	private:
-		std::unique_ptr<uint8_t, decltype(std::free)*> buffer = {nullptr, std::free};
+		static void deleteBuffer(uint8_t* data) {
+			bool isValid = _CrtIsValidHeapPointer(data);
+			DebugBreak();
+			printf("Serializer delete, except not actually...\n");
+			std::free(data);
+			printf("or maybe it is\n");
+		}
+		std::unique_ptr<uint8_t, decltype(deleteBuffer)*> buffer = {nullptr, deleteBuffer};
 		std::deque<std::unique_ptr<Transferable>> transferables;
 		std::deque<v8::CompiledWasmModule> wasm_modules;
 		size_t size;

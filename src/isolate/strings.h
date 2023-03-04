@@ -56,6 +56,7 @@ class StringTable {
 		String columnOffset{"columnOffset"};
 		String copy{"copy"};
 		String externalCopy{"externalCopy"};
+		String dynamicImportHandler{"dynamicImportHandler"};
 		String filename{"filename"};
 		String function{"function"};
 		String global{"global"};

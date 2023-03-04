@@ -149,6 +149,11 @@ declare module "isolated-vm" {
 		snapshot?: ExternalCopy<ArrayBuffer>;
 
 		/**
+		 * Callback to be invoked when the dynamic import function is called.
+		 */
+		dynamicImportHandler?: (specifier: string) => Promise<Module> | Module;
+
+		/**
 		 * Callback to be invoked when a *very bad* error occurs. If this is invoked it means that v8
 		 * has lost all control over the isolate, and all resources in use are totally unrecoverable. If
 		 * you receive this error you should log the error, stop serving requests, finish outstanding
